@@ -14,18 +14,23 @@ def load_zone():
     for zone in zone_files:
         with open(zone) as zone_data:
             data = json.load(zone_data)
-            zone_name = data["$origin"]
+            zone_name = data["$origin"].rstrip('.')
             json_zone[zone_name] = data
     return json_zone
 
 zone_data = load_zone()
- 
+
+def get_zone(domain):
+    global zone_data
+
+    zone_name = '.'.join(domain).rstrip('.')
+    return zone_data[zone_name]
+
 def build_question(domain_name, rec_type):
     qbytes = b''
 
     for part in domain_name:
-        length = len(part)
-        qbytes += bytes([length])
+        qbytes += bytes([len(part)])
 
         for char in part:
             qbytes += ord(char).to_bytes(1, byteorder='big')
@@ -37,12 +42,6 @@ def build_question(domain_name, rec_type):
 
     return qbytes
 
-def get_zone(domain):
-    global zone_data
-
-    zone_name = '.'.join(domain)
-    return zone_data[zone_name]
-
 def get_recs(data):
     domain, question_type = get_question_domain(data)
     qt = ''
@@ -52,28 +51,29 @@ def get_recs(data):
     return (zone[qt], qt, domain)
 
 def rec_to_bytes(domain_name, rec_type, rec_ttl, rec_val):
-    rbytes = b'\xc0\x0c'
+    rbytes = b'\xc0\x0c'            # Pointer to name in our question
+
+    # Type A
+    rbytes += (0).to_bytes(1, 'big') + (1).to_bytes(1, 'big')
+    # Class in
+    rbytes += (0).to_bytes(1, 'big') + (1).to_bytes(1, 'big')
+    # TTL
+    rbytes += int(rec_ttl).to_bytes(4, 'big')
 
     if rec_type == 'a':
-        rbytes = rbytes + bytes([0]) + bytes([1])
-
-    rbytes = rbytes + bytes([0]) + bytes([1])
-    rbytes += int(rec_ttl).to_bytes(4, byteorder= 'big')
-
-    if rec_type == 'a':
-        rbytes = rbytes + bytes([0]) + bytes([4])
-
+        rbytes += (0).to_bytes(1, 'big') + (4).to_bytes(1, 'big')
         for part in rec_val.split('.'):
             rbytes += bytes([int(part)])
-        return rbytes
+    return rbytes
 
 def get_question_domain(data):
-    state = 0 
-    expected_length = 0                             
+    state = 0
+    expected_length = 0
     domain_string = ''
     domain_parts = []
     x = 0
     y = 0
+
     for byte in data:
         if state == 1:
             if byte != 0:
@@ -87,63 +87,45 @@ def get_question_domain(data):
             if byte == 0:
                 domain_parts.append(domain_string)
                 break
-            else:
-                state = 1
-                expected_length = byte
-            y += 1
-        question_type = data[y : y + 2]
+        else:
+            state = 1
+            expected_length = byte
+        y += 1
 
-        return (domain_parts, question_type)
+    question_type = data[y : y + 2]
+    return (domain_parts, question_type)
 
-def get_flags(flags):
-    b1 = bytes(flags[:1]) # Built in to-bytes function
-    b2 = bytes(flags[1:2])
-    rflags = ''
-    # Byte 1
-    QR = '1'
-    OPCODE = '' # For simplicity, OPCODE will always be 0
-    for bit in range(1, 5):  # opcode bit length (4)  
-        OPCODE += str(ord(b1) & (1 << bit))         # 'ord': byte --> integer
-
-    AA = '1'                                        # Authoriative  answer
-    TC = '0'                                        # Truncation for requests larger than 512
-    RD = '0'                                        # Client asking the server if DNS offers recursion
-    # Byte 2
-    RA = '0'                                        # Server's response 0/1
-    Z = '000'                                       # Future proofing; not needed
-    RCODE = '0000'                                  # Response code determines the state of DNS response 
-
-    return int(QR + OPCODE + AA + TC + RD, 2).to_bytes(1, byteorder = 'big') + int(RA + Z + RCODE, 2).to_bytes(1, byteorder = 'big')
+def get_flags(_flags):
+    return b'\x84\x00'         # Hardcoded answer      
 
 def build_response(data):
 
     # Get transaction ID
-    TransactionID = data[:2] # Get 0 - 2 bytes
-
+    transaction_id = data[:2] # Get 0 - 2 bytes
+    records, rec_type, domain_name = get_recs(data[12:])
     # Get the flags
-    Flags = get_flags(data[2:4])
+    flags = get_flags(data[2:4])
     
     # Question count
-    QDCOUNT = b'\x00\x01'                              # A count of 1 in two byte
+    QDCOUNT = (1).to_bytes(2, 'big')                              # A count of 1 in two byte
 
     # Answer count                  
-    ANCOUNT = (len(get_recs(data[12:])[0])).to_bytes(2, byteorder='big')
+    ANCOUNT = len(records).to_bytes(2,'big')
     # Nameserver count
-    NSCOUNT = (0).to_bytes(2, byteorder='big')
+    NSCOUNT = (0).to_bytes(2, 'big')
     # Additional count
-    ARCOUNT = (0).to_bytes(2, byteorder='big')
-    dns_header = TransactionID + Flags + QDCOUNT + ANCOUNT + NSCOUNT + ARCOUNT
+    ARCOUNT = (0).to_bytes(2, 'big')
+    dns_header = transaction_id + flags + QDCOUNT + ANCOUNT + NSCOUNT + ARCOUNT
     # DNS body
-    dns_body = 'b'
-    # Answer to the query
-    records, rec_type, domain_name = get_recs(data[12:])
+    dns_body = b''
     dns_question = build_question(domain_name, rec_type)
 
+    # Answer to the question
     for record in records:
         dns_body += rec_to_bytes(domain_name, rec_type, record["ttl"], record["value"])
     return dns_header + dns_question + dns_body
 
 while True:
     data, addr = sock.recvfrom(512) # Assuming that every request is <= 512 bytes
-    r = build_response(data)
-    sock.sendto(r, addr)
+    response = build_response(data)
+    sock.sendto(response, addr)
